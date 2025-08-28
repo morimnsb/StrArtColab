@@ -1,0 +1,25 @@
+{
+  "data": "C:\\Users\\morte\\Desktop\\StrArt-Ov\\logs\\ranker_dataset.npz",
+  "epochs": 40,
+  "best_val": 3.792852188150088,
+  "out": "C:\\Users\\morte\\Desktop\\StrArt-Ov\\checkpoints\\edge_ranker.pt",
+  "feature_keys": [
+    "sum",
+    "mean",
+    "max",
+    "var",
+    "dens",
+    "length",
+    "sector",
+    "d_ang",
+    "cool_i",
+    "cool_j",
+    "sec_gap"
+  ],
+  "feat_norm": "zscore",
+  "gain_norm": "zscore",
+  "temperature": 0.5,
+  "group_topk": 128,
+  "hidden": 192,
+  "seed": 42
+}

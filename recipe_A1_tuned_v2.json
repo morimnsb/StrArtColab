@@ -1,0 +1,49 @@
+{
+  "image": "data/A1.png",
+  "size": [400, 400],
+  "preprocess": {
+    "gamma": 1.9,
+    "clahe_clip": 2.0,
+    "clahe_grid": 8,
+    "bilateral_d": 0,
+    "sharpen": 0.0,
+    "invert": false,
+    "circle_mask": false
+  },
+  "layout": { "shape": "circle", "num_nails": 360, "num_sectors": 12, "min_dist": 30 },
+  "params": {
+    "scorer": "hybrid",
+    "hybrid_topk": 256,
+    "shortlist_mode": "sector_need",
+
+    "nn_weight": 0.9,
+    "need_weight": 0.6,
+    "need_gamma": 1.6,
+
+    "orient_weight": 0.45,
+    "density_weight": 0.05,
+
+    "k_opacity": 0.05,
+    "thickness_px": 1,
+
+    "cooldown_steps": 20,
+    "cooldown_penalty": 0.35,
+    "min_angle_deg": 20.0,
+    "small_angle_penalty": 0.4,
+    "angle_penalty": 0.18,
+
+    "center_relief": 0.3,
+
+    "shortlist_k": 512,
+    "base_top_keep": 4096,
+
+    "early_stop_window": 50,
+    "early_stop_improve": 0.001,
+
+    "render_thickness": 1,
+    "snapshots_every": 0
+  },
+  "sequence": [],
+  "seed": 123,
+  "stats": { "lines_drawn": 700 }
+}

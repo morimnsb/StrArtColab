@@ -1,0 +1,153 @@
+name: StrArt GPU Pipeline (RunPod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_glob:
+        description: "Image glob (space-separated) to log NPZ from"
+        required: false
+        default: "data/A1.png data/A2.png"
+      num_lines:
+        description: "Lines per image"
+        required: false
+        default: "500"
+      scorer:
+        description: "Scorer: fast | delta_sse | hybrid"
+        required: false
+        default: "hybrid"
+      hybrid_topk:
+        description: "Hybrid shortlist rerank size"
+        required: false
+        default: "256"
+      epochs:
+        description: "Training epochs"
+        required: false
+        default: "12"
+      batch_size:
+        description: "Batch size (pairwise/reg = items, listwise = groups)"
+        required: false
+        default: "4096"
+      do_listwise:
+        description: "Also train listwise model? (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  strart:
+    runs-on: [self-hosted, linux, x64, gpu, runpod]
+    container:
+      image: nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+      options: --gpus all
+    env:
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Install OS deps
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip git libgl1 libglib2.0-0
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Python setup
+        run: |
+          python3 -m pip install --upgrade pip wheel setuptools
+          # If your repo has requirements.txt, prefer that:
+          if [ -f requirements.txt ]; then
+            python3 -m pip install -r requirements.txt
+          else
+            # Fallback minimal deps
+            python3 -m pip install "torch==2.3.1+cu121" --index-url https://download.pytorch.org/whl/cu121
+            python3 -m pip install numpy pillow opencv-python-headless matplotlib tqdm
+          fi
+
+      - name: Log NPZ from images (dataset build)
+        run: |
+          set -e
+          mkdir -p logs/train_extra
+          for IMG in ${{ github.event.inputs.image_glob }}; do
+            echo ">>> Logging from $IMG"
+            python3 -m scripts.select_lines_progressive \
+              --image "$IMG" \
+              --num_lines ${{ github.event.inputs.num_lines }} \
+              --scorer ${{ github.event.inputs.scorer }} \
+              --hybrid_topk ${{ github.event.inputs.hybrid_topk }} \
+              --log_ranker_npz logs/train_extra/ranker_logs.npz \
+              --out_dir "outputs/dataset_previews/$(basename "$IMG" .png)"
+          done
+
+      - name: Upload dataset NPZ + previews
+        uses: actions/upload-artifact@v4
+        with:
+          name: npz-and-previews
+          path: |
+            logs/train_extra/ranker_logs.npz
+            outputs/dataset_previews/**
+
+      - name: Train pairwise ranker
+        run: |
+          mkdir -p ckpts
+          python3 -m scripts.train_edge_ranker \
+            --npz logs/train_extra/ranker_logs.npz \
+            --out ckpts/edge_ranker_pairwise.pt \
+            --loss pairwise \
+            --epochs ${{ github.event.inputs.epochs }} \
+            --bs ${{ github.event.inputs.batch_size }} \
+            --hidden 128 \
+            --dropout 0.1
+
+      - name: Train regression ranker
+        run: |
+          python3 -m scripts.train_edge_ranker \
+            --npz logs/train_extra/ranker_logs.npz \
+            --out ckpts/edge_ranker_reg.pt \
+            --loss reg \
+            --epochs ${{ github.event.inputs.epochs }} \
+            --bs ${{ github.event.inputs.batch_size }} \
+            --hidden 128 \
+            --dropout 0.1
+
+      - name: Optional listwise ranker
+        if: ${{ github.event.inputs.do_listwise == 'true' }}
+        run: |
+          python3 -m scripts.train_edge_ranker \
+            --npz logs/train_extra/ranker_logs.npz \
+            --out ckpts/edge_ranker_listwise.pt \
+            --loss listwise \
+            --epochs ${{ github.event.inputs.epochs }} \
+            --bs 8 \
+            --hidden 128 \
+            --dropout 0.1 || echo "Listwise not supported in this repo's script—skipping."
+
+      - name: Benchmark rankers on sample images
+        run: |
+          mkdir -p bench_all
+          python3 -m scripts.benchmark_rankers \
+            --images ${{ github.event.inputs.image_glob }} \
+            --rankers none ckpts/edge_ranker_pairwise.pt ckpts/edge_ranker_reg.pt ckpts/edge_ranker_listwise.pt \
+            --out_root bench_all \
+            --num_lines ${{ github.event.inputs.num_lines }} \
+            --scorer ${{ github.event.inputs.scorer }} \
+            --hybrid_topk ${{ github.event.inputs.hybrid_topk }} \
+            --nn_weight 0.8 \
+            --need_weight 0.6 || \
+            python3 -m scripts.benchmark_rankers \
+              --images ${{ github.event.inputs.image_glob }} \
+              --rankers none ckpts/edge_ranker_pairwise.pt ckpts/edge_ranker_reg.pt \
+              --out_root bench_all \
+              --num_lines ${{ github.event.inputs.num_lines }} \
+              --scorer ${{ github.event.inputs.scorer }} \
+              --hybrid_topk ${{ github.event.inputs.hybrid_topk }} \
+              --nn_weight 0.8 \
+              --need_weight 0.6
+
+      - name: Upload checkpoints + bench
+        uses: actions/upload-artifact@v4
+        with:
+          name: ckpts-and-bench
+          path: |
+            ckpts/**
+            bench_all/**

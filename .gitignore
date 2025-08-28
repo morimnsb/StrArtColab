@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Envs
+env/
+.venv/
+venv/
+new-env/
+.env/
+
+# Build / binaries / libs
+*.dll
+*.lib
+*.pdb
+*.so
+*.dylib
+*.pyd
+*.exe
+
+# Data + heavy artifacts
+cache/
+outputs/
+logs/
+checkpoints/
+*.npz
+*.pth
+*.pt
+*.onnx
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+
+cache/
+*.npz
+
+
+cache/
+*.npz
+

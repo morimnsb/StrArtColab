@@ -1,0 +1,9 @@
+image,ranker,lines,seconds,mse,psnr
+data\A1.png,none,500,169.91,0.017286,17.623
+data\A1.png,edge_ranker_pairwise,500,126.98,0.015951,17.972
+data\A1.png,edge_ranker_reg,500,114.67,0.015908,17.984
+data\A1.png,edge_ranker_listwise,500,117.52,0.015895,17.987
+data\A2.png,none,500,135.80,0.015261,18.164
+data\A2.png,edge_ranker_pairwise,500,131.40,0.014576,18.364
+data\A2.png,edge_ranker_reg,500,127.49,0.014935,18.258
+data\A2.png,edge_ranker_listwise,500,124.65,0.014457,18.399

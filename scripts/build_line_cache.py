@@ -3,9 +3,15 @@
 import os, math, json, argparse
 import numpy as np
 from tqdm import tqdm
-from utils.generate_nails import generate_nail_positions
 from scoring.line_integral import line_pixels
 import cv2
+import sys
+# ensure project root is on sys.path
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from utils.generate_nails import generate_nail_positions
 
 def sector_index(pt, center, num_sectors):
     dx, dy = pt[0] - center[0], pt[1] - center[1]

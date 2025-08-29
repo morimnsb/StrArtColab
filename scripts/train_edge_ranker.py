@@ -1,12 +1,48 @@
-# scripts/train_edge_ranker.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, os, math, json
+import argparse, os, json
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List
+
+# ---------------------------
+# utils
+# ---------------------------
+
+def set_seed(seed: int = 123):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def resolve_device(arg: str = "auto") -> torch.device:
+    """Return a torch.device based on user arg and availability, and print it."""
+    arg = (arg or "auto").lower()
+    if arg == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    elif arg in ("cuda", "gpu"):
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        if dev == "cpu":
+            print("[WARN] CUDA requested but not available; falling back to CPU.")
+    elif arg == "cpu":
+        dev = "cpu"
+    else:
+        print(f"[WARN] Unrecognized --device '{arg}', using auto.")
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    d = torch.device(dev)
+    print(f"[INFO] Using device: {d} | cuda_available={torch.cuda.is_available()}")
+    if d.type == "cuda":
+        try:
+            print(f"[INFO] CUDA device: {torch.cuda.get_device_name(0)}")
+            print(f"[INFO] CUDA capability: {torch.cuda.get_device_capability(0)}")
+        except Exception:
+            pass
+    return d
 
 # --------- Model (same shape as at inference) ----------
 class EdgeRanker(nn.Module):
@@ -38,10 +74,11 @@ class PairwiseDataset(Dataset):
     def __init__(self, X, gains, groups, eps=1e-3):
         self.X = X; self.g = gains; self.grp = groups
         # index groups -> indices
-        self.by = {}
+        self.by: Dict[int, List[int]] = {}
         for i, gid in enumerate(groups):
             self.by.setdefault(int(gid), []).append(i)
-        self.keys = list(self.by.keys())
+        # use only groups with >=2 items
+        self.keys = [k for k,v in self.by.items() if len(v) >= 2]
         self.eps = float(eps)
 
     def __len__(self): return len(self.keys)
@@ -68,7 +105,7 @@ class ListwiseGroupDataset(Dataset):
     """Returns one whole shortlist (variable length) for 'listwise'."""
     def __init__(self, X, gains, groups):
         self.X = X; self.g = gains; self.grp = groups
-        self.by = {}
+        self.by: Dict[int, List[int]] = {}
         for i, gid in enumerate(groups):
             self.by.setdefault(int(gid), []).append(i)
         # keep only groups with at least 2 items
@@ -102,17 +139,6 @@ def listnet_loss(scores_g, gains_g, temperature=1.0):
     Q = torch.log_softmax(scores_g, dim=0)
     return -(P * Q).sum()
 
-# (Optional) ListMLE (uncomment to use instead of ListNet)
-# def listmle_loss(scores_g, gains_g):
-#     # sort by descending gains
-#     order = torch.argsort(gains_g, descending=True)
-#     s = scores_g[order]
-#     # -sum_i ( s_i - logsumexp_{j>=i} s_j )
-#     loss = 0.0
-#     for i in range(s.shape[0]):
-#         loss = loss + (torch.logsumexp(s[i:], dim=0) - s[i])
-#     return loss
-
 # --------- Main training ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -129,9 +155,13 @@ def main():
     ap.add_argument('--seed', type=int, default=123)
     ap.add_argument('--pair_eps', type=float, default=1e-3)
     ap.add_argument('--list_temp', type=float, default=1.0, help='Temperature for ListNet softmax on gains')
-    args = ap.parse_args()
+    # NEW:
+    ap.add_argument('--device', type=str, default='auto', help='auto|cuda|cpu')
+    ap.add_argument('--amp', action='store_true', help='Enable mixed precision on CUDA')
 
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    args = ap.parse_args()
+    set_seed(args.seed)
+    device = resolve_device(args.device)
 
     X, gains, groups = load_npzs(args.npz)
     in_dim = int(X.shape[1])
@@ -147,34 +177,35 @@ def main():
     Xtr, gtr, rtr = X[train_mask], gains[train_mask], groups[train_mask]
     Xva, gva, rva = X[val_mask],   gains[val_mask],   groups[val_mask]
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = EdgeRanker(in_dim, hidden=args.hidden, dropout=args.dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
     # datasets
+    pin = (device.type == "cuda")
     if args.loss == 'pairwise':
         ds_tr = PairwiseDataset(Xtr, gtr, rtr, eps=args.pair_eps)
-        dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True, drop_last=False)
+        dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True, drop_last=False, num_workers=2, pin_memory=pin)
     elif args.loss == 'reg':
         ds_tr = RegDataset(Xtr, gtr, rtr)
-        dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True, drop_last=False)
+        dl_tr = DataLoader(ds_tr, batch_size=args.bs, shuffle=True, drop_last=False, num_workers=2, pin_memory=pin)
     else:  # listwise
         ds_tr = ListwiseGroupDataset(Xtr, gtr, rtr)
         dl_tr = DataLoader(ds_tr, batch_size=max(1, args.bs), shuffle=True,
-                           collate_fn=listwise_collate, drop_last=False)
+                           collate_fn=listwise_collate, drop_last=False, num_workers=2, pin_memory=pin)
 
     # simple validation pair-accuracy (same as before)
     def val_pair_acc():
-        # sample random pairs within each val group
-        by = {}
+        by: Dict[int, List[int]] = {}
         for i, gid in enumerate(rva): by.setdefault(int(gid), []).append(i)
         correct = 0; total = 0
         model.eval()
         with torch.no_grad():
             for gid, idxs in by.items():
                 if len(idxs) < 2: continue
-                feat = torch.from_numpy(Xva[idxs]).to(device)
-                s = model(feat).cpu().numpy()
+                feat = torch.from_numpy(Xva[idxs]).to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+                    s = model(feat).detach().cpu().numpy()
                 y = gva[idxs]
                 # compare best vs worst
                 i_hi, i_lo = int(np.argmax(y)), int(np.argmin(y))
@@ -184,38 +215,47 @@ def main():
 
     # training loop
     best_va = -1.0
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
     for ep in range(1, args.epochs+1):
         model.train()
         running = 0.0
         for batch in dl_tr:
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             if args.loss == 'pairwise':
                 xp, xn = batch
-                xp = torch.from_numpy(xp).to(device) if isinstance(xp, np.ndarray) else xp.to(device)
-                xn = torch.from_numpy(xn).to(device) if isinstance(xn, np.ndarray) else xn.to(device)
-                sp = model(xp); sn = model(xn)
-                loss = pairwise_loss(sp, sn)
+                xp = torch.from_numpy(xp).to(device, non_blocking=True) if isinstance(xp, np.ndarray) else xp.to(device, non_blocking=True)
+                xn = torch.from_numpy(xn).to(device, non_blocking=True) if isinstance(xn, np.ndarray) else xn.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+                    sp = model(xp); sn = model(xn)
+                    loss = pairwise_loss(sp, sn)
             elif args.loss == 'reg':
                 x, y = batch
-                x = torch.from_numpy(x).to(device) if isinstance(x, np.ndarray) else x.to(device)
-                y = torch.from_numpy(y).to(device) if isinstance(y, np.ndarray) else y.to(device)
-                s = model(x)
-                loss = reg_loss(s, y)
+                x = torch.from_numpy(x).to(device, non_blocking=True) if isinstance(x, np.ndarray) else x.to(device, non_blocking=True)
+                y = torch.from_numpy(y).to(device, non_blocking=True) if isinstance(y, np.ndarray) else y.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+                    s = model(x)
+                    loss = reg_loss(s, y)
             else:  # listwise
-                # batch is a list of groups; sum losses / len(batch)
-                loss = 0.0
+                total = 0.0
                 for Xg, yg in batch:
-                    Xg = Xg.to(device); yg = yg.to(device)
-                    sg = model(Xg)
-                    loss = loss + listnet_loss(sg, yg, temperature=args.list_temp)
-                loss = loss / len(batch)
+                    Xg = Xg.to(device, non_blocking=True); yg = yg.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+                        sg = model(Xg)
+                        total = total + listnet_loss(sg, yg, temperature=args.list_temp)
+                loss = total / max(1, len(batch))
 
-            loss.backward()
-            opt.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             running += float(loss.item())
 
         va = val_pair_acc()
-        print(f"[{ep}/{args.epochs}] loss={running:.3f}  val_pair_acc={va:.3f}")
+        print(f"[{ep}/{args.epochs}] train_loss_sum={running:.3f}  val_pair_acc={va:.3f}")
 
         if va > best_va:
             best_va = va
@@ -228,8 +268,9 @@ def main():
                 temperature=1.0,
                 group_topk=None,
             )
-            os.makedirs(os.path.dirname(args.out), exist_ok=True)
             torch.save(ckpt, args.out)
+            print(f"  ↳ saved checkpoint: {args.out}")
+
     print(f"✅ best val_pair_acc={best_va:.3f}  saved to: {args.out}")
 
 if __name__ == '__main__':

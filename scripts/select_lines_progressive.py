@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-'''
+"""
 StrArt – Progressive line selection with perceptual preprocessing, residual-aware scoring,
 soft thread attenuation, AA line masks, nail cooldown, angle penalties, shortlisting, seeding,
 early stop, recipe export, and SVG export.
 
 Compatible with your existing line cache produced by scripts.build_line_cache.
-'''
+"""
+
 import os
-os.environ.setdefault('OMP_NUM_THREADS', str(max(1, os.cpu_count()//2)))
+os.environ.setdefault('OMP_NUM_THREADS', str(max(1, os.cpu_count() // 2)))
 
 import csv
 import json
@@ -23,9 +24,40 @@ import numpy as np
 from typing import Tuple, List, Optional, Dict, Any
 from utils.line_cache import load_line_cache
 from torch.serialization import safe_globals
+
+# ---------------------------
+# device helpers
+# ---------------------------
+
+def resolve_device(arg: str = "auto") -> torch.device:
+    """Return a torch.device based on user arg and availability, and print it."""
+    arg = (arg or "auto").lower()
+    if arg == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    elif arg in ("cuda", "gpu"):
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        if dev == "cpu":
+            print("[WARN] CUDA requested but not available; falling back to CPU.")
+    elif arg == "cpu":
+        dev = "cpu"
+    else:
+        print(f"[WARN] Unrecognized --device '{arg}', using auto.")
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    d = torch.device(dev)
+    print(f"[INFO] Using device: {d} | cuda_available={torch.cuda.is_available()}")
+    if d.type == "cuda":
+        try:
+            print(f"[INFO] CUDA device: {torch.cuda.get_device_name(0)}")
+            print(f"[INFO] CUDA capability: {torch.cuda.get_device_capability(0)}")
+        except Exception:
+            pass
+    return d
+
 # ---------------------------
 # utils
-# --------------------------
+# ---------------------------
+
 def save_or_append_npz(path, feats, gains, groups):
     if os.path.exists(path):
         z = np.load(path, allow_pickle=True)
@@ -63,11 +95,12 @@ def set_global_seed(seed: Optional[int] = None):
     np.random.seed(seed)
     try:
         torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     except Exception:
         pass
 
 def circle_mask(h: int, w: int, margin: float = 0.0) -> np.ndarray:
-    '''1 inside circle, 0 outside.'''
+    """1 inside circle, 0 outside."""
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
     r = min(cx, cy) - margin
@@ -84,9 +117,9 @@ def preprocess_image(
     invert: bool = False,
     apply_circle: bool = False,
 ) -> np.ndarray:
-    '''
+    """
     Returns float32 in [0,1], perceptually nicer for string art.
-    '''
+    """
     assert img_gray_u8.ndim == 2, 'Expect grayscale uint8'
     img = cv2.resize(img_gray_u8, size, interpolation=cv2.INTER_AREA)
 
@@ -139,14 +172,14 @@ class EdgeRanker(nn.Module):
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
-
-
-def load_edge_ranker(path: str, device: str='cpu'):
+def load_edge_ranker(path: str, device: torch.device = torch.device('cpu')):
+    """Load ranker checkpoint onto the requested device."""
+    map_location = device.type
     try:
         with safe_globals([np.core.multiarray._reconstruct]):
-            ckpt = torch.load(path, map_location=device, weights_only=True)
+            ckpt = torch.load(path, map_location=map_location, weights_only=True)
     except Exception:
-        ckpt = torch.load(path, map_location=device, weights_only=False)
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
     sd = ckpt.get('model', ckpt)
 
     # infer input dim
@@ -154,7 +187,6 @@ def load_edge_ranker(path: str, device: str='cpu'):
     if ckpt.get('norm_mean', None) is not None:
         in_dim = int(len(ckpt['norm_mean']))
     else:
-        # look for first linear weight
         for k, v in sd.items():
             if k.endswith('0.weight') or k.endswith('net.0.weight'):
                 in_dim = int(v.shape[1]); break
@@ -164,7 +196,6 @@ def load_edge_ranker(path: str, device: str='cpu'):
     hidden  = int(ckpt.get('hidden', 128))
     dropout = float(ckpt.get('dropout', 0.0))
     model = EdgeRanker(input_dim=in_dim, hidden=hidden, dropout=dropout).to(device)
-
 
     if not any(k.startswith('net.') for k in sd.keys()):
         sd = {f'net.{k}': v for k, v in sd.items()}
@@ -183,12 +214,10 @@ def load_edge_ranker(path: str, device: str='cpu'):
     }
     return model, norm_mean, norm_std, meta
 
-
-
 def extract_features_for_edges(cache: Dict[str, Any], darkness_map: np.ndarray) -> np.ndarray:
-    '''
+    """
     Minimal placeholder; extend to match your training.
-    '''
+    """
     num_edges = len(cache['pairs'])
     feats = np.zeros((num_edges, len(FEATURE_KEYS)), np.float32)
     feats[:, 0] = cache['lengths'].astype(np.float32)  # length
@@ -200,7 +229,7 @@ def extract_features_for_edges(cache: Dict[str, Any], darkness_map: np.ndarray) 
 # ---------------------------
 
 def edge_endpoints_from_coords(ys: np.ndarray, xs: np.ndarray) -> Tuple[int, int, int, int]:
-    '''Infer (x1,y1,x2,y2) from sampled line coordinates (first/last).'''
+    """Infer (x1,y1,x2,y2) from sampled line coordinates (first/last)."""
     y1, x1 = int(ys[0]), int(xs[0])
     y2, x2 = int(ys[-1]), int(xs[-1])
     return x1, y1, x2, y2
@@ -217,9 +246,9 @@ def draw_line_mask_roi(
     h: int, w: int, x1: int, y1: int, x2: int, y2: int,
     thickness: int = 1, aa: bool = True, pad: int = 2
 ) -> Tuple[slice, slice, np.ndarray]:
-    '''
+    """
     Create a small float mask ROI with an AA line drawn (0..1).
-    '''
+    """
     x_min = max(0, min(x1, x2) - thickness - pad)
     x_max = min(w - 1, max(x1, x2) + thickness + pad)
     y_min = max(0, min(y1, y2) - thickness - pad)
@@ -232,10 +261,10 @@ def draw_line_mask_roi(
     return slice(y_min, y_max + 1), slice(x_min, x_max + 1), roi
 
 def soft_attenuation_update(dst_dark: np.ndarray, mask: np.ndarray, k: float):
-    '''
+    """
     Thread stacking model: D_new = 1 - (1 - D_old) * (1 - k * mask)
     dst_dark[...] modified in-place.
-    '''
+    """
     np.multiply(1.0 - dst_dark, (1.0 - k * mask), out=dst_dark)
     np.subtract(1.0, dst_dark, out=dst_dark)
     np.clip(dst_dark, 0.0, 1.0, out=dst_dark)
@@ -245,7 +274,7 @@ def soft_attenuation_update(dst_dark: np.ndarray, mask: np.ndarray, k: float):
 # ---------------------------
 
 def draw_lines_preview(canvas_lines_xyxy: List[Tuple[int,int,int,int]], hw: Tuple[int,int], thickness: int = 1):
-    '''Render lines onto white canvas for preview (AA).'''
+    """Render lines onto white canvas for preview (AA)."""
     H, W = int(hw[0]), int(hw[1])
     canvas = np.full((H, W, 3), 255, np.uint8)
     for (x1, y1, x2, y2) in canvas_lines_xyxy:
@@ -253,7 +282,7 @@ def draw_lines_preview(canvas_lines_xyxy: List[Tuple[int,int,int,int]], hw: Tupl
     return canvas
 
 def save_canvas_triplet(out_dir, canvas_lines_xyxy, darkness_map, step=None, thickness: int = 1):
-    '''Save intermediate or final images.'''
+    """Save intermediate or final images."""
     os.makedirs(out_dir, exist_ok=True)
     H, W = darkness_map.shape
 
@@ -273,9 +302,9 @@ def save_canvas_triplet(out_dir, canvas_lines_xyxy, darkness_map, step=None, thi
         cv2.imwrite(os.path.join(out_dir, f'dark_{int(step):04d}.png'), dark_u8)
 
 def export_svg(out_path: str, lines_xyxy: List[Tuple[int,int,int,int]], w: int, h: int, stroke_px: float = 1.0):
-    '''
+    """
     Minimal, dependency-free SVG export of the line sequence at pixel coordinates.
-    '''
+    """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     header = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">\n'
     style  = f'  <g fill="none" stroke="black" stroke-width="{stroke_px}" stroke-linecap="round" stroke-linejoin="round">\n'
@@ -292,16 +321,16 @@ def export_svg(out_path: str, lines_xyxy: List[Tuple[int,int,int,int]], w: int, 
 
 class ProgressiveSelector:
     def __init__(self, target_img, cache, edge_ranker=None, device='cpu', params=None,
-                 norm_mean=None, norm_std=None):
+                 norm_mean=None, norm_std=None, amp: bool = False):
         self.target = np.clip(target_img.astype(np.float32), 0.0, 1.0)
         self.H, self.W = self.target.shape
         self.cache = cache
         self.edge_ranker = edge_ranker
-        self.device = device
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.amp = bool(amp and self.device.type == "cuda")
         self.norm_mean = norm_mean
         self.norm_std  = norm_std
-                # ---- params dict (must exist before we read it) ----
-        # In __init__, ensure defaults include density_weight:
+        # ---- params dict (must exist before we read it) ----
         P = dict(
             nn_weight=0.8, need_weight=0.58, need_gamma=1.30,
             fast_score=True, score_norm=True, dyn_len_norm=True,
@@ -312,13 +341,12 @@ class ProgressiveSelector:
             center_relief=0.35, angle_penalty=0.18,
             early_stop_window=50, early_stop_improve=1e-3,
             render_thickness=1, snapshots_every=0,
-            density_weight=0.0,     
+            density_weight=0.0,
             scorer='hybrid',
             hybrid_topk=256,
             min_gain_eps=1e-5,
             no_gain_patience=3,
             num_sectors=int(cache.get('num_sectors', 12)),
-            # ← add this
         )
         if params:
             P.update(params)
@@ -335,9 +363,7 @@ class ProgressiveSelector:
         self.grad_theta = theta
 
         # Precompute image gradients (orientation + strength)
-
         self.grad_angle = (np.degrees(np.arctan2(gy, gx)) + 360.0) % 360.0  # 0..360
-        gm = np.hypot(gx, gy)
 
         # convenience flag
         self.fast_score = bool(self.P.get('fast_score', False))
@@ -364,7 +390,6 @@ class ProgressiveSelector:
         self.log_groups = []   # list of [K] arrays (same step id)
         self._cur_step  = 0
 
-
         self.angle_hist = np.zeros(36, np.float32)   # 10° bins
         self.angle_penalty = float(self.P.get('angle_penalty', 0.12))
 
@@ -379,16 +404,14 @@ class ProgressiveSelector:
             self._pair_to_index[(a, b)] = idx
             self._pair_to_index[(b, a)] = idx
 
-
-
     def _cooldown_set(self) -> set:
         K = self.P['cooldown_steps']
         return set(self.nail_recent[-K:]) if K > 0 else set()
 
     def _build_dyn_features(self, k: int, need_full: np.ndarray) -> np.ndarray:
         if self.fast_score:
-            s,m,mx,v,dens,L,sec = self._line_stats_fast(need_full, k)
-            x1,y1,x2,y2 = edge_endpoints_from_coords(self.cache['ys'][k], self.cache['xs'][k])
+            s, m, mx, v, dens, L, sec = self._line_stats_fast(need_full, k)
+            x1, y1, x2, y2 = edge_endpoints_from_coords(self.cache['ys'][k], self.cache['xs'][k])
         else:
             ys_k = self.cache['ys'][k]; xs_k = self.cache['xs'][k]
             x1, y1, x2, y2 = edge_endpoints_from_coords(ys_k, xs_k)
@@ -400,7 +423,6 @@ class ProgressiveSelector:
             v  = float(((vals - m)**2).sum() / (mask.sum() + 1e-6))
             dens = float(((1.0 - need_full[ysli, xsli]) * mask).sum() / (mask.sum() + 1e-6))
             L  = float(self.cache['lengths'][k]); sec = float(self.cache['sectors'][k])
-
 
         # dynamics (same as before)
         ang_cur = edge_angle_deg(x1, y1, x2, y2)
@@ -416,8 +438,7 @@ class ProgressiveSelector:
         cool_i = 1.0 if i in cool_set else 0.0
         cool_j = 1.0 if jn in cool_set else 0.0
 
-        return np.array([s,m,mx,v,dens,L,sec,d_ang,cool_i,cool_j,sec_gap], np.float32)
-
+        return np.array([s, m, mx, v, dens, L, sec, d_ang, cool_i, cool_j, sec_gap], np.float32)
 
     def _line_stats_fast(self, need_full: np.ndarray, k: int):
         ys = self.cache['ys'][k]; xs = self.cache['xs'][k]
@@ -450,17 +471,14 @@ class ProgressiveSelector:
         part = np.argpartition(-base_vals, topN - 1)[:topN]
         return idxs[part]
 
-
     def _prefilter_by_need(self, need_full, keep):
         idxs = np.where(~self.used)[0]
         if keep <= 0 or keep >= len(idxs):
             return idxs
-        # approximate dynamic gain along sampled coords
         gains = np.fromiter(
             (float(need_full[self.cache['ys'][k], self.cache['xs'][k]].sum()) for k in idxs),
             dtype=np.float32, count=len(idxs)
         )
-        # optional: add a touch of orientation to the prefilter
         if self.P.get('orient_weight', 0.0) > 0.0:
             def orient_boost(k):
                 ys, xs = self.cache['ys'][k], self.cache['xs'][k]
@@ -476,27 +494,11 @@ class ProgressiveSelector:
 
     def _score_candidates_dynamic(self, idxs: np.ndarray) -> Tuple[int, float]:
         """
-        Pick the candidate that maximizes the exact reduction in residual error.
-
-        Thread stacking update per pixel:
-          D_new = D_old + k * M * (1 - D_old)
-          R_pre_lin  = clip(T - D_old, 0, 1)
-          R_post_lin = clip(T - D_new, 0, 1)
-          d_lin      = R_pre_lin - R_post_lin   (>= 0)
-
-        If need_gamma != 1:
-          d_eff = (R_pre_lin**g - R_post_lin**g)
-
-        Score:
-          S = nn_weight*base + need_weight*(sum(d_eff)/L)
-              + orient_weight * sum(d_eff * gm * align)
-              - density_weight * sum(D_old * M)
-              - cooldown/small-angle/angle-hist penalties
+        Score candidates and pick the best one.
         """
         if len(idxs) == 0:
             return -1, 0.0
 
-        # Common arrays/flags
         D = self.dark
         T = self.desired_darkness
         k = float(self.P['k_opacity'])
@@ -506,24 +508,19 @@ class ProgressiveSelector:
         density_w = float(self.P.get('density_weight', 0.0))
         cool = self._cooldown_set()
 
-        # Residual need once
         need_full = np.clip(T - D, 0.0, 1.0)
 
-          # ---------- shortlist (choose pool candidates)
+        # shortlist
         shortlist = min(self.P['shortlist_k'], len(idxs))
-        mode = self.P.get('shortlist_mode', 'need')  # 'need' | 'sector_need' | 'base' | 'random' | 'sector_random'
-
+        mode = self.P.get('shortlist_mode', 'need')
         if mode == 'base':
             base_subset = self.base_scores[idxs]
             part = np.argpartition(-base_subset, shortlist - 1)[:shortlist]
             cand = idxs[part]
-
         elif mode == 'random':
             cand = np.random.choice(idxs, size=shortlist, replace=False)
-
         elif mode == 'sector_random':
             cand = self._sector_random_shortlist(idxs, shortlist, int(self.P.get('num_sectors', 12)))
-
         elif mode == 'sector_need':
             sectors = self.cache['sectors']
             nsec = int(self.cache.get('num_sectors', int(sectors.max()) + 1 if sectors.size else 1))
@@ -551,7 +548,6 @@ class ProgressiveSelector:
                     part = np.argpartition(-prescore, take - 1)[:take]
                     chosen.extend(remaining[part].tolist())
             cand = np.asarray(chosen[:shortlist], dtype=np.int32)
-
         else:  # 'need'
             prescore = np.array(
                 [need_full[self.cache['ys'][k], self.cache['xs'][k]].sum() for k in idxs],
@@ -559,28 +555,29 @@ class ProgressiveSelector:
             )
             part = np.argpartition(-prescore, shortlist - 1)[:shortlist]
             cand = idxs[part]
+
         scorer_mode = str(self.P.get('scorer', 'hybrid'))
         hybrid_topk = int(self.P.get('hybrid_topk', 0))
-        # In hybrid mode, reduce cand to top-K by ΔSSE-only (fast pass)
         if scorer_mode == 'hybrid' and hybrid_topk > 0 and len(cand) > hybrid_topk:
             cand = self._re_rank_by_delta_sse(cand, need_full, hybrid_topk)
 
-        # ---------- features/NN on current residual
+        # features & NN (on device)
         feats_cand = np.stack([self._build_dyn_features(k_idx, need_full) for k_idx in cand]).astype(np.float32)
-
         nn_scores = None
         if self.edge_ranker is not None:
             feats = feats_cand
             if self.norm_mean is not None and self.norm_std is not None:
                 feats = (feats - self.norm_mean) / (self.norm_std + 1e-6)
             with torch.no_grad():
-                t = torch.from_numpy(feats).float().to(self.device)
-                nn_scores = self.edge_ranker(t).cpu().numpy().astype(np.float32)
+                t = torch.from_numpy(feats).float().to(self.device, non_blocking=True)
+                # AMP for inference if CUDA
+                with torch.cuda.amp.autocast(enabled=self.amp):
+                    nn_out = self.edge_ranker(t)
+                nn_scores = nn_out.detach().cpu().numpy().astype(np.float32)
             if self.P.get('score_norm', True):
                 mu = float(nn_scores.mean()); sd = float(nn_scores.std() + 1e-6)
                 nn_scores = (nn_scores - mu) / sd
 
-        # ---------- candidate scoring (exact per-pixel simulation)
         gains_cand = np.empty(len(cand), np.float32)
         best_idx = -1
         best_score = -1e30
@@ -601,31 +598,20 @@ class ProgressiveSelector:
             d_lin = (R_pre_lin - R_post_lin)
             d_lin_sum = float(d_lin.sum())
 
-            # ✅ ALWAYS compute ΔSSE once
             delta_sse_gain = self._delta_sse_gain_roi(R_pre_lin, M, k)
+            gains_cand[j] = delta_sse_gain if (scorer_mode == 'delta_sse') else d_lin_sum
 
-            # ✅ Log gain consistently
-            if scorer_mode == 'delta_sse':
-                gains_cand[j] = delta_sse_gain
-            else:
-                gains_cand[j] = d_lin_sum
-
-            # scorer selection
             use_delta_only = (scorer_mode == 'delta_sse')
             if use_delta_only:
                 base = 0.0
                 d_eff_sum = delta_sse_gain
                 L = float(self.cache['lengths'][k_idx]) if dyn_len_norm else 1.0
             else:
-                if g != 1.0:
-                    d_eff = np.power(R_pre_lin, g, dtype=np.float32) - np.power(R_post_lin, g, dtype=np.float32)
-                else:
-                    d_eff = d_lin
+                d_eff = (np.power(R_pre_lin, g, dtype=np.float32) - np.power(R_post_lin, g, dtype=np.float32)) if g != 1.0 else d_lin
                 d_eff_sum = float(d_eff.sum())
                 L = float(self.cache['lengths'][k_idx]) if dyn_len_norm else 1.0
                 base = nn_scores[j] if nn_scores is not None else self.base_scores[k_idx]
 
-            # orientation reward on *effective improvement*
             orient_term = 0.0
             if ow > 0.0:
                 line_ang = edge_angle_deg(x1, y1, x2, y2)
@@ -633,16 +619,15 @@ class ProgressiveSelector:
                 gm = self.grad_mag[ysli, xsli]
                 diff = np.abs((((ga + 90.0) - line_ang + 180.0) % 360.0) - 180.0)
                 align = 1.0 - np.clip(diff / 90.0, 0.0, 1.0)
-                # weight by improvement proxy: d_eff (fast/hybrid) or R_pre*M (delta-only)
                 improv = d_eff if not use_delta_only else (R_pre_lin * M)
                 orient_term = float((improv * gm * align).sum())
 
             density_term = float((D_old * M).sum()) if density_w > 0.0 else 0.0
 
-            score = ( (0.0 if use_delta_only else (self.P['nn_weight'] * base))
-                    + self.P['need_weight'] * (d_eff_sum / (L + 1e-6))
-                    + ow * orient_term
-                    - density_w * density_term)
+            score = ((0.0 if use_delta_only else (self.P['nn_weight'] * base))
+                     + self.P['need_weight'] * (d_eff_sum / (L + 1e-6))
+                     + ow * orient_term
+                     - density_w * density_term)
 
             # cooldown + small-angle + angle-hist
             i, jn = int(self.cache['pairs'][k_idx][0]), int(self.cache['pairs'][k_idx][1])
@@ -695,8 +680,6 @@ class ProgressiveSelector:
     def _delta_sse_gain_roi(self, R_roi: np.ndarray, M: np.ndarray, alpha: float) -> float:
         """
         Exact ΔSSE over ROI: sum( r^2 - (r - alpha*M)^2 ) = sum( 2*alpha*M*r - (alpha*M)^2 ).
-        R_roi: current residual (T - D) clipped to [0,1] at ROI
-        M: AA line mask in [0,1]
         """
         aM = alpha * M
         return float(np.sum(2.0 * aM * R_roi - aM * aM))
@@ -712,9 +695,6 @@ class ProgressiveSelector:
             return cand
         part = np.argpartition(-gains, K-1)[:K]
         return cand[part]
-
-
-
 
     def _sector_random_shortlist(self, idxs: np.ndarray, k_shortlist: int, n_sectors: int) -> np.ndarray:
         """Ensure angular coverage by sampling ~k/S per sector."""
@@ -733,42 +713,25 @@ class ProgressiveSelector:
             return np.random.choice(idxs, size=k_shortlist, replace=False)
         sel = np.unique(np.concatenate(picks))
         if sel.size < k_shortlist:
-            # fill remaining from leftovers
             left = np.setdiff1d(idxs, sel, assume_unique=False)
             if left.size:
                 extra = np.random.choice(left, size=min(k_shortlist - sel.size, left.size), replace=False)
                 sel = np.concatenate([sel, extra])
-        # trim if we overshot
         if sel.size > k_shortlist:
             sel = np.random.choice(sel, size=k_shortlist, replace=False)
         return sel
-
-    # def _scale_lines(lines_xyxy: List[Tuple[int,int,int,int]], s: float) -> List[Tuple[int,int,int,int]]:
-    #     if s == 1.0:
-    #         return lines_xyxy
-    #     out = []
-    #     for (x1,y1,x2,y2) in lines_xyxy:
-    #         out.append((int(round(x1*s)), int(round(y1*s)),
-    #                     int(round(x2*s)), int(round(y2*s))))
-    #     return out
 
     def _get_roi_mask(self, k_idx: int):
         if all(key in self.cache for key in ('roi_y0','roi_y1','roi_x0','roi_x1','masks')):
             y0 = int(self.cache['roi_y0'][k_idx]); y1 = int(self.cache['roi_y1'][k_idx])
             x0 = int(self.cache['roi_x0'][k_idx]); x1 = int(self.cache['roi_x1'][k_idx])
             ysli = slice(y0, y1 + 1); xsli = slice(x0, x1 + 1)
-            # masks are uint8 0..255 in shards
             M = np.asarray(self.cache['masks'][k_idx], dtype=np.float32) / 255.0
             return ysli, xsli, M
-        # fallback: draw on the fly
         ys_k = self.cache['ys'][k_idx]; xs_k = self.cache['xs'][k_idx]
         x1p, y1p, x2p, y2p = edge_endpoints_from_coords(ys_k, xs_k)
         return draw_line_mask_roi(self.H, self.W, x1p, y1p, x2p, y2p,
                                   thickness=self.P['thickness_px'], aa=True)
-
-
-
-
 
     def _seed_structure(self, n_seed: int, q: float):
         if n_seed <= 0:
@@ -800,6 +763,7 @@ class ProgressiveSelector:
                 break
         self.last_line_angle = None
         self.last_line_endpoints = None
+
     def run(self, num_lines: int, out_dir: Optional[str] = None, snapshots_every: int = 0):
         # --- safety: ensure params dict exists ---
         if not hasattr(self, 'P') or self.P is None:
@@ -837,15 +801,13 @@ class ProgressiveSelector:
             else:
                 no_gain = 0
 
-
-            
             if best_idx < 0:
                 break
 
             self._commit_edge(best_idx)
             gains.append(float(gain))
 
-            if snapshots_every > 0 and out_dir is not None and ((len(self.chosen_pairs)) % snapshots_every == 0):
+            if snapshots_every > 0 and out_dir is not None and (len(self.chosen_pairs) % snapshots_every == 0):
                 save_canvas_triplet(out_dir, self.canvas_lines_xyxy, self.dark, step=len(self.chosen_pairs),
                                     thickness=self.P['render_thickness'])
 
@@ -857,7 +819,7 @@ class ProgressiveSelector:
 
         return self.chosen_pairs, self.canvas_lines_xyxy, self.dark
 
-    # ---------------------------
+# ---------------------------
 # image IO
 # ---------------------------
 
@@ -997,7 +959,6 @@ def main():
     parser.add_argument('--num_sectors', type=int, default=12)
     parser.add_argument('--min_dist', type=int, default=30)
 
-
     parser.add_argument('--orient_weight', type=float, default=0.0,
                         help='Weight for orientation alignment bonus (0=off)')
     # preprocessing
@@ -1042,33 +1003,37 @@ def main():
     parser.add_argument('--log_ranker_npz', type=str, default=None,
         help='If set, save (append) shortlist features/gains/groups to an NPZ for training')
     parser.add_argument('--nn_weight', type=float, default=0.8)
-    # --- SCORER / HYBRID / EARLY-STOP ---
+
+    # --- scorer/hybrid ---
     parser.add_argument('--scorer', default='hybrid', choices=['fast', 'delta_sse', 'hybrid'],
-                        help="fast: your current scorer; delta_sse: exact ΔSSE; hybrid: shortlist->re-rank by ΔSSE")
+                        help="fast: current scorer; delta_sse: exact ΔSSE; hybrid: shortlist then ΔSSE rerank")
     parser.add_argument('--hybrid_topk', type=int, default=256,
                         help="In hybrid mode, re-rank this many candidates by ΔSSE (+penalties).")
     parser.add_argument('--min_gain_eps', type=float, default=1e-5,
                         help="If best ΔSSE gain <= eps, count as 'no-gain' for early stop.")
     parser.add_argument('--no_gain_patience', type=int, default=3,
                         help="Stop after this many consecutive no-gain steps.")
-    # in argparse, near other constraints/speed flags
     parser.add_argument('--rand_subset_frac', type=float, default=0.0,
-                        help='If > 0, randomly subsample this fraction of unused edges each step before shortlist (0..1].')
+                        help='Randomly subsample this fraction of unused edges before shortlist.')
     parser.add_argument('--rand_subset_min', type=int, default=4096,
-                        help='Minimum pool size to keep after random subsampling.')
+                        help='Minimum pool size after random subsampling.')
+
     parser.add_argument('--render_scale', type=float, default=1.0,
                         help='Scale factor for *rendering only* (images & SVG). 1.0 = no scale.')
     parser.add_argument('--svg_stroke_scaled', action='store_true',
                         help='If set, multiply svg_stroke by render_scale.')
 
+    # NEW: device / amp for NN inference
+    parser.add_argument('--device', type=str, default='auto', help='auto|cuda|cpu')
+    parser.add_argument('--amp', action='store_true', help='Enable mixed-precision for NN inference on CUDA')
+
     args = parser.parse_args()
     set_global_seed(args.seed)
     args = _apply_recipe(args)
+
+    # device resolve + announce
+    device = resolve_device(args.device)
     print(f"[replay] using image: {args.image}")
-
-
-
-    
 
     # load + preprocess
     raw = load_image_gray(args.image)
@@ -1096,9 +1061,8 @@ def main():
     # ranker
     ranker = None; norm_mean = None; norm_std = None
     if args.edge_ranker:
-        ranker, norm_mean, norm_std, meta = load_edge_ranker(args.edge_ranker)
-
-        print(f'🤖 Loaded NN ranker from {args.edge_ranker}')
+        ranker, norm_mean, norm_std, meta = load_edge_ranker(args.edge_ranker, device=device)
+        print(f'🤖 Loaded NN ranker from {args.edge_ranker} onto {device}')
 
     params = dict(
         k_opacity=args.k_opacity,
@@ -1122,29 +1086,28 @@ def main():
         nn_weight=args.nn_weight if hasattr(args, 'nn_weight') else 0.8,
         score_norm=not args.no_score_norm if hasattr(args,'no_score_norm') else True,
         dyn_len_norm=not args.no_dyn_len_norm if hasattr(args,'no_dyn_len_norm') else True,
-        center_relief=getattr(args, 'center_relief', 0.0),   
-        angle_penalty=getattr(args, 'angle_penalty', 0.0), 
+        center_relief=getattr(args, 'center_relief', 0.0),
+        angle_penalty=getattr(args, 'angle_penalty', 0.0),
         orient_weight=float(getattr(args, 'orient_weight', 0.0)),
         shortlist_mode=args.shortlist_mode,
-        # NEW:
         scorer=args.scorer,
         hybrid_topk=args.hybrid_topk,
         min_gain_eps=args.min_gain_eps,
         no_gain_patience=args.no_gain_patience,
         rand_subset_frac=getattr(args, 'rand_subset_frac', 0.0),
         rand_subset_min=getattr(args, 'rand_subset_min', 4096),
-
     )
 
     selector = ProgressiveSelector(
-    target_img=target,
-    cache=cache,
-    edge_ranker=ranker,
-    device='cpu',
-    params=params,
-    norm_mean=norm_mean,
-    norm_std=norm_std,
-)
+        target_img=target,
+        cache=cache,
+        edge_ranker=ranker,
+        device=device,
+        params=params,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        amp=args.amp,
+    )
 
     t0 = time.time()
     chosen_pairs, canvas_lines_xyxy, darkness_map = selector.run(

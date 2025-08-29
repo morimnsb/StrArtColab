@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List
+from torch.amp import GradScaler, autocast
 
 # ---------------------------
 # utils
@@ -179,7 +180,8 @@ def main():
 
     model = EdgeRanker(in_dim, hidden=args.hidden, dropout=args.dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+    scaler = GradScaler('cuda', enabled=(args.amp and device.type == "cuda"))
+
 
     # datasets
     pin = (device.type == "cuda")
